@@ -35,13 +35,14 @@ if exec_mode == "server":
     threading.Thread(target=network_interface.listen_for_messages, daemon=True).start()
 else:
     host, port = sys.argv[2].rsplit(":", 1)
-    game_state = GameState(exec_mode, manager)
-    try:
-        network_interface = ClientConnect(host, int(port))
-        game_state.set_network_interface(network_interface)
-        threading.Thread(target=network_interface.listen_for_messages, daemon=True).start()
-    except OSError as error:
-        game_state.ui_state.show_user_message(f"Connection failed: {error}")
+    client_connection_factory = lambda username: ClientConnect(
+        host, int(port), username
+    )
+    game_state = GameState(
+        exec_mode,
+        manager,
+        client_connection_factory=client_connection_factory,
+    )
 
 while running:
     time_delta = clock.tick(60) / 1000.0
@@ -61,6 +62,6 @@ while running:
     manager.draw_ui(screen)
     pygame.display.flip()
 
-if network_interface is not None:
-    network_interface.close()
+if game_state.network_interface is not None:
+    game_state.network_interface.close()
 pygame.quit()

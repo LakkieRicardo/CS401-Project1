@@ -44,18 +44,29 @@ class StateUI():
         self.button_a = pygame_gui.elements.UIButton(relative_rect=pygame.Rect((350, 175), (100, 50)), text='Button A', manager=manager)
 
     def add_chat_message(self, message: str) -> None:
-        self.chat_history.append_html_text(f"{html.escape(message)}<br>")
+        self.game_state.message_history.append(message)
+        self.show_message_history(self.game_state.message_history)
 
     def show_user_message(self, message: str) -> None:
-        self.chat_history.append_html_text(
+        self.game_state.message_history.append(message)
+        self.show_message_history(self.game_state.message_history)
+
+    def show_message_history(self, messages: list[str]) -> None:
+        formatted_messages = "".join(
             f'<font color="#ffcccc">{html.escape(message)}</font><br>'
+            for message in messages
         )
+        self.chat_history.set_text(formatted_messages)
+        if self.chat_history.scroll_bar is not None:
+            self.chat_history.scroll_bar.set_scroll_from_start_percentage(1.0)
 
     def process_command(self, command: str) -> None:
         if command == "/hello":
             self.show_user_message("APP: HAIII :3")
         elif command == "/help":
-            self.show_user_message("APP: Available commands: /help /hello")
+            self.show_user_message("APP: Available commands: /help /hello /accept /reject")
+        elif command in ("/accept", "/reject"):
+            self.game_state.process_command(command)
         else:
             self.show_user_message("ERROR: Unrecognized command. Type /help for help.")
 
