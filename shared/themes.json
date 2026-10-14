@@ -3,5 +3,22 @@
     "colours": {
       "dark_bg": "#222222"
     }
+  },
+  "#players_panel": {
+    "colours": {
+      "dark_bg": "#202729"
+    }
+  },
+  "#health_panel": {
+    "colours": {
+      "dark_bg": "#202729"
+    }
+  },
+  "#health_bar": {
+    "colours": {
+      "filled_bar": "#e3434f",
+      "unfilled_bar": "#492329",
+      "normal_border": "#bb7a7e"
+    }
   }
 }

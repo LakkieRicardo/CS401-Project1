@@ -1,6 +1,13 @@
 from server.server_ui import ServerStateUI
 from client.client_ui import ClientStateUI
-from .networking import NetworkInterface
+from .networking import (
+    CHAT_MESSAGE_TYPE,
+    HEALTH_UPDATE_TYPE,
+    NetworkInterface,
+    decode_chat_message,
+    decode_health_update,
+    encode_chat_message,
+)
 from queue import Empty, SimpleQueue
 from collections.abc import Callable
 from threading import Thread
@@ -20,15 +27,18 @@ class GameState():
         self._client_connection_factory = client_connection_factory
         self.message_history: list[str] = []
         self._incoming_network_messages: SimpleQueue[bytes] = SimpleQueue()
+        self._incoming_health_updates: SimpleQueue[tuple[int, int]] = SimpleQueue()
         self._incoming_disconnects: SimpleQueue[OSError | None] = SimpleQueue()
         self._incoming_connection_requests: SimpleQueue[tuple[UUID, str, str]] = SimpleQueue()
         self._incoming_connection_cancellations: SimpleQueue[tuple[UUID, str, str]] = SimpleQueue()
+        self.current_health: int | None = None
+        self.max_health: int | None = None
+        self.network_interface = None
         if exec_mode == "server":
             self.ui_state = ServerStateUI(pygame_ui_manager, self)
         elif exec_mode == "connect":
             self.ui_state = ClientStateUI(pygame_ui_manager, self)
             self.ui_state.show_user_message("Enter your username in chat to connect.")
-        self.network_interface = None
         if network_interface is not None:
             self.set_network_interface(network_interface)
 
@@ -56,6 +66,16 @@ class GameState():
         self._incoming_connection_cancellations.put((client_id, client_ip, username))
 
     def handle_network_message(self, message: bytes) -> None:
+        if not message:
+            return
+        if message[0] == HEALTH_UPDATE_TYPE:
+            if self.exec_mode == "connect":
+                health_update = decode_health_update(message)
+                if health_update is not None:
+                    self._incoming_health_updates.put(health_update)
+            return
+        if message[0] != CHAT_MESSAGE_TYPE:
+            return
         if self.exec_mode == "server" and self.network_interface is not None:
             self.network_interface.send_message(message)
         self._incoming_network_messages.put(message)
@@ -89,8 +109,18 @@ class GameState():
                 message = self._incoming_network_messages.get_nowait()
             except Empty:
                 break
-            self.message_history.append(message.decode("utf-8", errors="replace"))
-            history_changed = True
+            chat_message = decode_chat_message(message)
+            if chat_message is not None:
+                self.message_history.append(chat_message)
+                history_changed = True
+        while True:
+            try:
+                current_health, max_health = self._incoming_health_updates.get_nowait()
+            except Empty:
+                break
+            self.current_health = current_health
+            self.max_health = max_health
+            self.ui_state.update_own_health(current_health, max_health)
         while True:
             try:
                 self._incoming_disconnects.get_nowait()
@@ -102,6 +132,8 @@ class GameState():
             history_changed = True
         if history_changed:
             self.ui_state.show_message_history(self.message_history)
+        if self.exec_mode == "server":
+            self.ui_state.refresh_player_list()
 
     def process_command(self, command: str) -> None:
         command_parts = command.split(maxsplit=1)
@@ -200,4 +232,4 @@ class GameState():
             ).start()
             self.ui_state.show_user_message(f"Connecting to {self.network_interface.get_connection_addr()} as {username}...")
             return
-        self.network_interface.send_message(message.encode())
+        self.network_interface.send_message(encode_chat_message(message))

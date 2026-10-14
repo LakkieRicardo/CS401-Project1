@@ -10,7 +10,14 @@ from threading import Thread
 from typing import Literal
 from uuid import UUID, uuid4
 
-from shared.networking import NetworkInterface
+from shared.networking import (
+    CHAT_MESSAGE_TYPE,
+    NetworkInterface,
+    decode_chat_message,
+    encode_chat_message,
+    encode_health_update,
+    extract_complete_messages,
+)
 
 
 @dataclass
@@ -19,8 +26,11 @@ class ClientConnection:
     connection: socket.socket
     address: tuple[str, int]
     username: str
+    max_health: int = 20
+    current_health: int = 20
     decision: threading.Event = field(default_factory=threading.Event)
     connection_state: Literal["pending", "accepted"] = "pending"
+    send_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
 
 class _MessageHandler(socketserver.BaseRequestHandler):
@@ -34,15 +44,30 @@ class _MessageHandler(socketserver.BaseRequestHandler):
             )
             if client is None:
                 self.request.sendall(
-                    b"Server rejected your connection: this IP address is banned."
+                    encode_chat_message(
+                        "Server rejected your connection: this IP address is banned."
+                    )
                 )
                 return
             if not host._wait_for_connection_decision(client):
                 return
+            pending = bytearray()
+
+            def enqueue_chat_message(frame: bytes) -> None:
+                if not frame or frame[0] != CHAT_MESSAGE_TYPE:
+                    return
+                chat_message = decode_chat_message(frame)
+                if chat_message is not None:
+                    host._incoming_messages.put(
+                        encode_chat_message(f"{client.username}: {chat_message}")
+                    )
+
             while data := self.request.recv(1024):
-                host._incoming_messages.put(
-                    f"{client.username}: ".encode("utf-8") + data
-                )
+                pending.extend(data)
+                for message in extract_complete_messages(pending):
+                    enqueue_chat_message(message)
+            if pending and pending[0] == CHAT_MESSAGE_TYPE:
+                enqueue_chat_message(bytes(pending))
         except OSError:
             pass
         finally:
@@ -78,6 +103,20 @@ class ServerHost(NetworkInterface):
     def client_connections(self) -> dict[UUID, ClientConnection]:
         with self._connections_lock:
             return dict(self._client_conns)
+
+    @property
+    def accepted_players(self) -> tuple[tuple[UUID, str, int, int], ...]:
+        with self._connections_lock:
+            return tuple(
+                (
+                    client.client_id,
+                    client.username,
+                    client.current_health,
+                    client.max_health,
+                )
+                for client in self._client_conns.values()
+                if client.connection_state == "accepted"
+            )
 
     @property
     def pending_connections(self) -> dict[UUID, ClientConnection]:
@@ -147,6 +186,7 @@ class ServerHost(NetworkInterface):
             return True
 
     def accept_pending_connection(self) -> tuple[UUID, str, str] | None:
+        accepted_client = None
         with self._connections_lock:
             while self._pending_conn_order:
                 client_id = self._pending_conn_order.popleft()
@@ -155,8 +195,27 @@ class ServerHost(NetworkInterface):
                     continue
                 client.connection_state = "accepted"
                 client.decision.set()
-                return client_id, client.username, client.address[0]
-        return None
+                accepted_client = client
+                break
+        if accepted_client is None:
+            return None
+        try:
+            with accepted_client.send_lock:
+                accepted_client.connection.sendall(
+                    encode_health_update(
+                        accepted_client.current_health,
+                        accepted_client.max_health,
+                    )
+                )
+        except OSError:
+            self._remove_connection(accepted_client.client_id)
+            accepted_client.connection.close()
+            return None
+        return (
+            accepted_client.client_id,
+            accepted_client.username,
+            accepted_client.address[0],
+        )
 
     def reject_pending_connection(self) -> tuple[UUID, str, str] | None:
         with self._connections_lock:
@@ -172,7 +231,7 @@ class ServerHost(NetworkInterface):
             else:
                 return None
         try:
-            connection.sendall(b"Server rejected your connection.")
+            connection.sendall(encode_chat_message("Server rejected your connection."))
             connection.shutdown(socket.SHUT_WR)
         except OSError:
             pass
@@ -193,7 +252,7 @@ class ServerHost(NetworkInterface):
             message = (
                 f"User {username} ({client_ip}) has been kicked from the server."
             )
-            self.send_message(message.encode("utf-8"))
+            self.send_message(encode_chat_message(message))
         self._remove_connection(client.client_id)
         try:
             client.connection.shutdown(socket.SHUT_RDWR)
@@ -232,22 +291,53 @@ class ServerHost(NetworkInterface):
             self._banned_ips.discard(normalized_ip)
         return was_banned
 
+    def set_player_health(
+        self, client_id: UUID, current_health: int, max_health: int | None = None
+    ) -> tuple[int, int] | None:
+        with self._connections_lock:
+            client = self._client_conns.get(client_id)
+            if client is None or client.connection_state != "accepted":
+                return None
+            resolved_max_health = (
+                client.max_health if max_health is None else max_health
+            )
+            if (
+                type(current_health) is not int
+                or type(resolved_max_health) is not int
+                or resolved_max_health <= 0
+                or resolved_max_health > 0xFFFFFFFF
+                or not 0 <= current_health <= resolved_max_health
+            ):
+                raise ValueError("Player health must be between zero and max health.")
+            client.current_health = current_health
+            client.max_health = resolved_max_health
+            update = encode_health_update(current_health, resolved_max_health)
+        try:
+            with client.send_lock:
+                client.connection.sendall(update)
+        except OSError:
+            self._remove_connection(client_id)
+            return None
+        return current_health, resolved_max_health
+
     def send_message(self, message: bytes) -> None:
         with self._connections_lock:
-            connections = tuple(
-                client.connection
+            clients = tuple(
+                client
                 for client in self._client_conns.values()
                 if client.connection_state == "accepted"
             )
-        for connection in connections:
+        for client in clients:
+            connection = client.connection
             try:
-                connection.sendall(message)
+                with client.send_lock:
+                    connection.sendall(message)
             except OSError:
                 with self._connections_lock:
                     stale_ids = [
                         client_id
-                        for client_id, client in self._client_conns.items()
-                        if client.connection is connection
+                        for client_id, connected_client in self._client_conns.items()
+                        if connected_client.connection is connection
                     ]
                 for client_id in stale_ids:
                     self._remove_connection(client_id)
@@ -280,7 +370,7 @@ class ServerHost(NetworkInterface):
 def host_server(port):
     server = ServerHost(port)
     server.set_message_callback(
-        lambda message: print(message.decode("utf-8", errors="replace"))
+        lambda message: print(decode_chat_message(message))
     )
     message_listener = Thread(target=server.listen_for_messages, daemon=True)
     message_listener.start()

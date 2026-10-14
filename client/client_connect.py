@@ -1,7 +1,7 @@
 import socket
 from collections import deque
 import time
-from shared.networking import NetworkInterface
+from shared.networking import NetworkInterface, encode_chat_message
 
 message_q = deque()
 
@@ -41,7 +41,7 @@ def connect_to_server(host, port, username):
         while True:
             if len(message_q) > 0:
                 msg_to_send = message_q.popleft()
-                client.send_message(msg_to_send.encode("utf-8"))
+                client.send_message(encode_chat_message(msg_to_send))
             else:
                 time.sleep(0.1)
     finally:
