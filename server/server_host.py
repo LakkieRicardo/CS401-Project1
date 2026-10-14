@@ -2,6 +2,7 @@ import socketserver
 import socket
 import select
 import threading
+import ipaddress
 from collections import deque
 from dataclasses import dataclass, field
 from queue import Queue
@@ -31,10 +32,17 @@ class _MessageHandler(socketserver.BaseRequestHandler):
             client = host._queue_connection(
                 self.request, self.client_address, username
             )
+            if client is None:
+                self.request.sendall(
+                    b"Server rejected your connection: this IP address is banned."
+                )
+                return
             if not host._wait_for_connection_decision(client):
                 return
             while data := self.request.recv(1024):
-                host._incoming_messages.put(data)
+                host._incoming_messages.put(
+                    f"{client.username}: ".encode("utf-8") + data
+                )
         except OSError:
             pass
         finally:
@@ -57,6 +65,7 @@ class ServerHost(NetworkInterface):
         self._incoming_messages: Queue[bytes] = Queue()
         self._client_conns: dict[UUID, ClientConnection] = {}
         self._pending_conn_order: deque[UUID] = deque()
+        self._banned_ips: set[str] = set()
         self._connections_lock = threading.Lock()
         self._serving = threading.Event()
         self._server = _ThreadedTCPServer((host, port), self)
@@ -96,14 +105,20 @@ class ServerHost(NetworkInterface):
 
     def _queue_connection(
         self, connection: socket.socket, address: tuple[str, int], username: str
-    ) -> ClientConnection:
+    ) -> ClientConnection | None:
         client_id = uuid4()
         client = ClientConnection(client_id, connection, address, username)
         with self._connections_lock:
+            if self._normalize_ip_address(address[0]) in self._banned_ips:
+                return None
             self._client_conns[client_id] = client
             self._pending_conn_order.append(client_id)
             self._dispatch_connection_request(client_id, address[0], username)
         return client
+
+    @staticmethod
+    def _normalize_ip_address(ip_address: str) -> str:
+        return ipaddress.ip_address(ip_address).compressed
 
     def _wait_for_connection_decision(self, client: ClientConnection) -> bool:
         while not client.decision.wait(0.1):
@@ -170,6 +185,52 @@ class ServerHost(NetworkInterface):
             client = self._client_conns.pop(client_id, None)
             if client is not None and client.connection_state == "pending":
                 client.decision.set()
+
+    def _disconnect_client(self, client: ClientConnection) -> tuple[str, str]:
+        username = client.username
+        client_ip = client.address[0]
+        if client.connection_state == "accepted":
+            message = (
+                f"User {username} ({client_ip}) has been kicked from the server."
+            )
+            self.send_message(message.encode("utf-8"))
+        self._remove_connection(client.client_id)
+        try:
+            client.connection.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        client.connection.close()
+        return username, client_ip
+
+    def kick_client(self, username: str) -> tuple[str, str] | None:
+        with self._connections_lock:
+            matches = tuple(
+                client
+                for client in self._client_conns.values()
+                if client.username == username
+                and client.connection_state == "accepted"
+            )
+        if len(matches) != 1:
+            return None
+        return self._disconnect_client(matches[0])
+
+    def ban_ip(self, ip_address: str) -> tuple[tuple[str, str], ...]:
+        normalized_ip = self._normalize_ip_address(ip_address)
+        with self._connections_lock:
+            self._banned_ips.add(normalized_ip)
+            clients = tuple(
+                client
+                for client in self._client_conns.values()
+                if self._normalize_ip_address(client.address[0]) == normalized_ip
+            )
+        return tuple(self._disconnect_client(client) for client in clients)
+
+    def unban_ip(self, ip_address: str) -> bool:
+        normalized_ip = self._normalize_ip_address(ip_address)
+        with self._connections_lock:
+            was_banned = normalized_ip in self._banned_ips
+            self._banned_ips.discard(normalized_ip)
+        return was_banned
 
     def send_message(self, message: bytes) -> None:
         with self._connections_lock:

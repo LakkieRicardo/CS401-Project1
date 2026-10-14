@@ -64,8 +64,16 @@ class StateUI():
         if command == "/hello":
             self.show_user_message("APP: HAIII :3")
         elif command == "/help":
-            self.show_user_message("APP: Available commands: /help /hello /accept /reject")
-        elif command in ("/accept", "/reject"):
+            self.show_user_message(
+                "APP: Available commands: /help /hello /accept /reject /kick <username> /ban <ip address> /unban <ip address>"
+            )
+        elif command.split(maxsplit=1)[0] in (
+            "/accept",
+            "/reject",
+            "/kick",
+            "/ban",
+            "/unban",
+        ):
             self.game_state.process_command(command)
         else:
             self.show_user_message("ERROR: Unrecognized command. Type /help for help.")

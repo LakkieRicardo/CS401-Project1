@@ -20,6 +20,7 @@ class GameState():
         self._client_connection_factory = client_connection_factory
         self.message_history: list[str] = []
         self._incoming_network_messages: SimpleQueue[bytes] = SimpleQueue()
+        self._incoming_disconnects: SimpleQueue[OSError | None] = SimpleQueue()
         self._incoming_connection_requests: SimpleQueue[tuple[UUID, str, str]] = SimpleQueue()
         self._incoming_connection_cancellations: SimpleQueue[tuple[UUID, str, str]] = SimpleQueue()
         if exec_mode == "server":
@@ -40,6 +41,9 @@ class GameState():
         self.network_interface.set_connection_cancelled_callback(
             self.handle_connection_cancelled
         )
+        self.network_interface.set_disconnect_callback(
+            self.handle_network_disconnected
+        )
 
     def handle_connection_request(
         self, client_id: UUID, client_ip: str, username: str
@@ -55,6 +59,10 @@ class GameState():
         if self.exec_mode == "server" and self.network_interface is not None:
             self.network_interface.send_message(message)
         self._incoming_network_messages.put(message)
+
+    def handle_network_disconnected(self, error: OSError | None) -> None:
+        if self.exec_mode == "connect":
+            self._incoming_disconnects.put(error)
 
     def process_network_messages(self) -> None:
         history_changed = False
@@ -83,28 +91,87 @@ class GameState():
                 break
             self.message_history.append(message.decode("utf-8", errors="replace"))
             history_changed = True
+        while True:
+            try:
+                self._incoming_disconnects.get_nowait()
+            except Empty:
+                break
+            self.message_history.append(
+                "You are no longer connected to the server. Please close the app."
+            )
+            history_changed = True
         if history_changed:
             self.ui_state.show_message_history(self.message_history)
 
     def process_command(self, command: str) -> None:
+        command_parts = command.split(maxsplit=1)
+        command_name = command_parts[0]
+        argument = command_parts[1].strip() if len(command_parts) > 1 else ""
+
         if self.exec_mode != "server" or self.network_interface is None:
-            self.ui_state.show_user_message("Only the server can accept or reject clients.")
+            self.ui_state.show_user_message(
+                "Only the server can manage client connections."
+            )
             return
 
-        if command == "/accept":
+        if command_name == "/accept" and not argument:
             result = self.network_interface.accept_pending_connection()
             response = (
                 f"Accepted {result[1]} from {result[2]}"
                 if result is not None
                 else "There are no pending connections to accept."
             )
-        elif command == "/reject":
+        elif command_name == "/reject" and not argument:
             result = self.network_interface.reject_pending_connection()
             response = (
                 f"Rejected {result[1]} from {result[2]}"
                 if result is not None
                 else "There are no pending connections to reject."
             )
+        elif command_name == "/kick":
+            if not argument:
+                self.ui_state.show_user_message("Usage: /kick <username>")
+                return
+            result = self.network_interface.kick_client(argument)
+            response = (
+                f"User {result[0]} ({result[1]}) has been kicked from the server."
+                if result is not None
+                else f"No unique accepted client named {argument}."
+            )
+        elif command_name == "/ban":
+            if not argument:
+                self.ui_state.show_user_message("Usage: /ban <ip address>")
+                return
+            try:
+                kicked_clients = self.network_interface.ban_ip(argument)
+            except ValueError:
+                self.ui_state.show_user_message("Enter a valid IP address to ban.")
+                return
+            if kicked_clients is None:
+                response = "IP bans are not supported by this server."
+            else:
+                for username, client_ip in kicked_clients:
+                    self.ui_state.show_user_message(
+                        f"User {username} ({client_ip}) has been kicked from the server."
+                    )
+                response = f"Banned IP address {argument}. Future requests will be rejected."
+        elif command_name == "/unban":
+            if not argument:
+                self.ui_state.show_user_message("Usage: /unban <ip address>")
+                return
+            try:
+                was_banned = self.network_interface.unban_ip(argument)
+            except ValueError:
+                self.ui_state.show_user_message("Enter a valid IP address to unban.")
+                return
+            if was_banned is None:
+                response = "IP unbans are not supported by this server."
+            elif was_banned:
+                response = (
+                    f"Unbanned IP address {argument}. Future requests will no longer be automatically rejected."
+                )
+            else:
+                response = f"IP address {argument} was not banned."
         else:
             return
         self.ui_state.show_user_message(response)

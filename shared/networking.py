@@ -7,6 +7,7 @@ from uuid import UUID
 MessageCallback = Callable[[bytes], None]
 ConnectionRequestCallback = Callable[[UUID, str, str], None]
 ConnectionCancelledCallback = Callable[[UUID, str, str], None]
+DisconnectCallback = Callable[[OSError | None], None]
 
 
 class NetworkInterface(ABC):
@@ -14,6 +15,7 @@ class NetworkInterface(ABC):
         self._message_callback: MessageCallback | None = None
         self._connection_request_callback: ConnectionRequestCallback | None = None
         self._connection_cancelled_callback: ConnectionCancelledCallback | None = None
+        self._disconnect_callback: DisconnectCallback | None = None
 
     def set_message_callback(self, callback: MessageCallback) -> None:
         self._message_callback = callback
@@ -44,18 +46,39 @@ class NetworkInterface(ABC):
         if self._connection_cancelled_callback is not None:
             self._connection_cancelled_callback(client_id, client_ip, username)
 
+    def set_disconnect_callback(self, callback: DisconnectCallback) -> None:
+        self._disconnect_callback = callback
+
+    def _dispatch_disconnect(self, error: OSError | None) -> None:
+        if self._disconnect_callback is not None:
+            self._disconnect_callback(error)
+
     def accept_pending_connection(self) -> tuple[UUID, str, str] | None:
         return None
 
     def reject_pending_connection(self) -> tuple[UUID, str, str] | None:
         return None
 
+    def kick_client(self, username: str) -> tuple[str, str] | None:
+        return None
+
+    def ban_ip(self, ip_address: str) -> tuple[tuple[str, str], ...] | None:
+        return None
+
+    def unban_ip(self, ip_address: str) -> bool | None:
+        return None
+
     def listen_for_messages(self) -> None:
-        try:
-            while message := self.receive_message():
-                self._dispatch_message(message)
-        except OSError:
-            return
+        while True:
+            try:
+                message = self.receive_message()
+            except OSError as error:
+                self._dispatch_disconnect(error)
+                return
+            if not message:
+                self._dispatch_disconnect(None)
+                return
+            self._dispatch_message(message)
 
     @abstractmethod
     def send_message(self, message: bytes) -> None:
