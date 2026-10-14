@@ -41,7 +41,6 @@ class StateUI():
             container=self.chat_panel,
             object_id="#chat_history",
         )
-        self.button_a = pygame_gui.elements.UIButton(relative_rect=pygame.Rect((350, 175), (100, 50)), text='Button A', manager=manager)
 
     def add_chat_message(self, message: str) -> None:
         self.game_state.message_history.append(message)
@@ -82,8 +81,6 @@ class StateUI():
         pass
 
     def process_events(self, event) -> bool:
-        if event.type == pygame_gui.UI_BUTTON_PRESSED and event.ui_element == self.button_a:
-            print("button a clicked")
         if (
             event.type == pygame.KEYDOWN
             and event.key in (pygame.K_RETURN, pygame.K_KP_ENTER)
